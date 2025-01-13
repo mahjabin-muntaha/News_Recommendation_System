@@ -70,6 +70,11 @@ class FeatureEngineering:
     def run(self):
         if os.path.exists('interaction_matrix.pkl'):
             if os.path.exists('embeddings.pkl'):
+                category_encoded = pd.get_dummies(self.news['category'], prefix='category')
+                subcategory_encoded = pd.get_dummies(self.news['sub_category'], prefix='sub_category')
+
+                # Concatenate with the original DataFrame
+                self.news = pd.concat([self.news, category_encoded, subcategory_encoded], axis=1)
                 self.news['combined_entities'] = self.news['combined_entities'].apply(literal_eval)
                 all_entities = [entity['Label'] for entities in self.news['combined_entities'] for entity in entities]
                 # Train a Word2Vec model
@@ -78,6 +83,19 @@ class FeatureEngineering:
                     lambda entities: [self.get_entity_embedding(e['Label'], model) for e in entities if
                                       self.get_entity_embedding(e['Label'], model) is not None]
                 )
+                with open('embeddings.pkl', 'rb') as f:
+                    embeddings = pickle.load(f)
+                self.news['title_embedding'] = embeddings['title_embedding']
+                self.news['abstract_embedding'] = embeddings['abstract_embedding']
+                self.news['combined_features'] = self.news.apply(
+                    lambda row: list(row['title_embedding']) +
+                                list(row['abstract_embedding']) +
+                                list(row[category_encoded.columns]) +
+                                list(row[subcategory_encoded.columns]) +
+                                [item for sublist in row['entity_embeddings'] for item in sublist],
+                    axis=1
+                )
+                self.news.to_csv('news_features.csv', index=False)
             else:
                 # Apply preprocessing to the abstract column before tokenization
                 self.news['abstract'] = self.news['abstract'].apply(self.preprocess_text)
