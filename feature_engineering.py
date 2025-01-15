@@ -8,7 +8,6 @@ from transformers import AutoTokenizer, AutoModel
 import torch
 from gensim.models import Word2Vec
 import os
-import json
 
 
 class FeatureEngineering:
@@ -69,45 +68,64 @@ class FeatureEngineering:
 
     def run(self):
         if os.path.exists('interaction_matrix.pkl'):
-            if os.path.exists('embeddings.pkl'):
-                category_encoded = pd.get_dummies(self.news['category'], prefix='category')
-                subcategory_encoded = pd.get_dummies(self.news['sub_category'], prefix='sub_category')
-
-                # Concatenate with the original DataFrame
-                self.news = pd.concat([self.news, category_encoded, subcategory_encoded], axis=1)
-                self.news['combined_entities'] = self.news['combined_entities'].apply(literal_eval)
-                all_entities = [entity['Label'] for entities in self.news['combined_entities'] for entity in entities]
-                # Train a Word2Vec model
-                model = Word2Vec(sentences=all_entities, vector_size=100, window=5, min_count=1, workers=4)
-                self.news['entity_embeddings'] = self.news['combined_entities'].apply(
-                    lambda entities: [self.get_entity_embedding(e['Label'], model) for e in entities if
-                                      self.get_entity_embedding(e['Label'], model) is not None]
-                )
-                with open('embeddings.pkl', 'rb') as f:
-                    embeddings = pickle.load(f)
-                self.news['title_embedding'] = embeddings['title_embedding']
-                self.news['abstract_embedding'] = embeddings['abstract_embedding']
-                self.news['combined_features'] = self.news.apply(
-                    lambda row: list(row['title_embedding']) +
-                                list(row['abstract_embedding']) +
-                                list(row[category_encoded.columns]) +
-                                list(row[subcategory_encoded.columns]) +
-                                [item for sublist in row['entity_embeddings'] for item in sublist],
-                    axis=1
-                )
-                self.news.to_csv('news_features.csv', index=False)
-            else:
-                # Apply preprocessing to the abstract column before tokenization
-                self.news['abstract'] = self.news['abstract'].apply(self.preprocess_text)
-                self.news['title_embedding'] = self.news['title'].apply(self.encode_with_bert)
-                self.news['abstract_embedding'] = self.news['abstract'].apply(self.encode_with_bert)
-                with open('embeddings.pkl', 'wb') as f:
-                    pickle.dump(self.news[['title_embedding', 'abstract_embedding']], f)
-
+            with open('interaction_matrix.pkl', 'rb') as f:
+                int_matrix = pickle.load(f)
         else:
             int_matrix = self.create_interaction_matrix()
             with open('interaction_matrix.pkl', 'wb') as f:
                 pickle.dump(int_matrix, f)
 
+        if os.path.exists('embeddings.pkl'):
+            with open('embeddings.pkl', 'rb') as f:
+                embeddings = pickle.load(f)
+        else:
+            # Apply preprocessing to the abstract column before tokenization
+            self.news['abstract'] = self.news['abstract'].apply(self.preprocess_text)
+            self.news['title_embedding'] = self.news['title'].apply(self.encode_with_bert)
+            self.news['abstract_embedding'] = self.news['abstract'].apply(self.encode_with_bert)
+            embeddings = self.news[['title_embedding', 'abstract_embedding']]
+            with open('embeddings.pkl', 'wb') as f:
+                pickle.dump(embeddings, f)
+        if os.path.exists('news_features.pkl'):
+            with open('news_features.pkl', 'rb') as f:
+                news_features = pickle.load(f)
+        else:
+            self.news['combined_entities'] = self.news['combined_entities'].apply(literal_eval)
+            all_entities = [[entity['Label'] for entity in entities] for entities in self.news['combined_entities']]
 
+            # Train a Word2Vec model with adjusted parameters
+            model = Word2Vec(sentences=all_entities, vector_size=100, window=5, min_count=1, workers=4)
+
+            self.news['entity_embeddings'] = self.news['combined_entities'].apply(
+                lambda entities: [self.get_entity_embedding(e['Label'], model) for e in entities if
+                                  self.get_entity_embedding(e['Label'], model) is not None]
+            )
+
+            category_encoded = pd.get_dummies(self.news['category'], prefix='category')
+            subcategory_encoded = pd.get_dummies(self.news['sub_category'], prefix='sub_category')
+
+            # Concatenate with the original DataFrame
+            self.news = pd.concat([self.news, category_encoded, subcategory_encoded], axis=1)
+            self.news['title_embedding'] = embeddings['title_embedding']
+            self.news['abstract_embedding'] = embeddings['abstract_embedding']
+            with open('news_features.pkl', 'wb') as f:
+                pickle.dump(self.news, f)
+            self.news['combined_features'] = self.news.apply(
+                lambda row: list(row['title_embedding']) +
+                            list(row['abstract_embedding']) +
+                            list(row[category_encoded.columns]) +
+                            list(row[subcategory_encoded.columns]) +
+                            [item for sublist in row['entity_embeddings'] for item in sublist],
+                axis=1
+            )
+            with open('combined_features.pkl', 'wb') as f:
+                pickle.dump(self.news['combined_features'], f)
+
+        if os.path.exists('user_features.pkl'):
+            with open('user_features.pkl', 'rb') as f:
+                user_features = pickle.load(f)
+        else:
+            print(news_features.columns)
+            print('original_news ',self.news.columns)
+            print(news_features['combined_features'].head())
 
