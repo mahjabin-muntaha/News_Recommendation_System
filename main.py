@@ -10,6 +10,6 @@ news = pd.read_csv('news_cleaned.csv')
 print(f'Behaviors: {behaviors.columns}')
 print(f'impressions: {behaviors["impressions"][0]}')
 
-
 feature_engineering = FeatureEngineering(behaviors, news)
 feature_engineering.run()
+

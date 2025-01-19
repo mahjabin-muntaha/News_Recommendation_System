@@ -8,6 +8,8 @@ from transformers import AutoTokenizer, AutoModel
 import torch
 from gensim.models import Word2Vec
 import os
+import numpy as np
+import implicit
 
 
 class FeatureEngineering:
@@ -125,7 +127,39 @@ class FeatureEngineering:
             with open('user_features.pkl', 'rb') as f:
                 user_features = pickle.load(f)
         else:
-            print(news_features.columns)
-            print('original_news ',self.news.columns)
-            print(news_features['combined_features'].head())
+            self.behaviors['history'] = self.behaviors['history'].apply(eval)
+            news_embeddings_map = {
+                row['news_id']: np.concatenate([row['title_embedding'], row['abstract_embedding']])
+                for _, row in embeddings.iterrows()
+            }
 
+            # Compute user embeddings
+            user_profiles = {}
+            for _, row in self.behaviors.iterrows():
+                user_id = row['user_id']
+                clicked_articles = row['history']
+
+                # Retrieve valid embeddings
+                valid_embeddings = [
+                    news_embeddings_map[article_id]
+                    for article_id in clicked_articles if article_id in news_embeddings_map
+                ]
+
+                if valid_embeddings:
+                    user_profiles[user_id] = np.mean(valid_embeddings, axis=0)
+
+            with open('user_features.pkl', 'wb') as f:
+                pickle.dump(user_profiles, f)
+
+        interaction_matrix = int_matrix.T
+        # Train ALS model
+        model = implicit.als.AlternatingLeastSquares(
+            factors=128,  # Number of latent factors
+            regularization=0.1,
+            iterations=20
+        )
+        model.fit(interaction_matrix)
+
+        # User and item embeddings
+        user_factors = model.user_factors  # Shape: (num_users, factors)
+        item_factors = model.item_factors  # Shape: (num_items, factors)
