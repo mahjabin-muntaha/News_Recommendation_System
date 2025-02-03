@@ -1,4 +1,6 @@
 import pandas as pd
+import os
+import pickle
 
 
 behaviors = pd.read_csv('behaviors_cleaned.csv')
@@ -38,3 +40,16 @@ test_file = 'datasets/test_set.csv'
 train_set.to_csv(train_file, index=False)
 val_set.to_csv(val_file, index=False)
 test_set.to_csv(test_file, index=False)
+
+def load_pickle(file_path):
+    """ Utility function to load pickle files efficiently """
+    if os.path.exists(file_path):
+        with open(file_path, 'rb') as f:
+            return pickle.load(f)
+    return None  # Return None if file doesn't exist
+
+def save_pickle(obj, file_path):
+    """ Utility function to save pickle files efficiently """
+    with open(file_path, 'wb') as f:
+        pickle.dump(obj, f)
+

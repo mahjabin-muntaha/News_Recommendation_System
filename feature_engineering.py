@@ -10,14 +10,10 @@ from gensim.models import Word2Vec
 import os
 import numpy as np
 from implicit.als import AlternatingLeastSquares
-
-import tensorflow as tf
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Dense, Concatenate
-
+from util import load_pickle, save_pickle
 
 class FeatureEngineering:
-    def __init__(self, behaviors, news):
+    def __init__(self, behaviors, news, location):
         self.subcategory_columns = None
         self.category_columns = None
         self.behaviors = behaviors
@@ -26,6 +22,7 @@ class FeatureEngineering:
         self.model = AutoModel.from_pretrained('distilbert-base-uncased')
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = self.model.to(self.device)
+        self.file_path = location
 
     def create_interaction_matrix(self):
         user_ids = []
@@ -57,14 +54,24 @@ class FeatureEngineering:
         )
         return interaction_matrix
 
-    def encode_with_bert(self, text):
-        inputs = self.tokenizer(text, return_tensors='pt', truncation=True, padding=True, max_length=64)
-        inputs = {key: tensor.to(self.device) for key, tensor in inputs.items()}  # Move all tensors to GPU
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-            # Compute the mean embedding and move it to CPU before converting to NumPy
-        embedding = outputs.last_hidden_state.mean(dim=1).squeeze().cpu().numpy()
-        return embedding
+    def encode_texts_with_bert(self, texts, batch_size=16):
+        """ Efficiently encode texts using DistilBERT in smaller batches """
+        self.model.eval()  # Set model to evaluation mode
+        embeddings = []
+
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]  # Create batch
+            inputs = self.tokenizer(batch, return_tensors='pt', truncation=True, padding=True, max_length=64)
+            inputs = {key: tensor.to(self.device) for key, tensor in inputs.items()}  # Move to GPU if available
+
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+                batch_embeddings = outputs.last_hidden_state.mean(
+                    dim=1).cpu().numpy()  # Move to CPU before NumPy conversion
+
+            embeddings.extend(batch_embeddings)
+
+        return np.array(embeddings)  # Convert list to NumPy array
 
     def get_entity_embedding(self, entity, model):
         return model.wv[entity] if entity in model.wv else None
@@ -93,35 +100,80 @@ class FeatureEngineering:
         combined = title_emb + abstract_emb + category_emb + subcategory_emb + entity_emb
         return combined
 
-    # Compute and store entity embeddings in the DataFrame before apply()
     def compute_entity_embedding(self, entities, model):
-        embeddings = [self.get_entity_embedding(e['Label'], model) for e in entities if
-                      self.get_entity_embedding(e['Label'], model) is not None]
-        return np.mean(embeddings, axis=0).tolist() if embeddings else [0] * 100  # Default zero vector
+        valid_embeddings = np.array([
+            model.wv[e['Label']] for e in entities if e['Label'] in model.wv
+        ])
+        return valid_embeddings.mean(axis=0).tolist() if len(valid_embeddings) > 0 else [0] * 100  # Zero vector fallback
+
+    def get_hybrid_embeddings(self, user_ids, news_ids, user_cf_embeddings, news_cf_embeddings, user_profiles):
+        unique_users = sorted(set(user_ids))
+        unique_news = sorted(set(news_ids))
+        user_id_to_index = {user_id: idx for idx, user_id in enumerate(unique_users)}
+        news_id_to_index = {news_id: idx for idx, news_id in enumerate(unique_news)}
+        filtered_news_id_to_index = {news_id: idx for news_id, idx in news_id_to_index.items() if
+                                     idx < len(news_cf_embeddings)}
+
+        news_cf_map = {news_id: news_cf_embeddings[idx] for news_id, idx in filtered_news_id_to_index.items()}
+        user_cf_map = {user_id: user_cf_embeddings[idx] for user_id, idx in user_id_to_index.items()}
+        content_embeddings = load_pickle(self.file_path + 'combined_features.pkl')
+
+        content_embeddings_dict = content_embeddings.set_index('news_id')['combined_features'].to_dict()
+        hybrid_user_embeddings = {user_id: np.concatenate([user_cf_map[user_id], user_profiles[user_id]]) for user_id in
+                                  user_cf_map if user_id in user_profiles}
+        alpha = 0.7
+
+        hybrid_news_embeddings = {news_id: np.concatenate([news_cf_map[news_id], content_embeddings_dict[news_id]])
+                                  for news_id in news_cf_map if news_id in content_embeddings_dict}
+
+        return hybrid_user_embeddings, hybrid_news_embeddings
+
+    def load_data(self, hybrid_user_embeddings, hybrid_news_embeddings):
+        if os.path.exists(self.file_path + 'final_embeddings/user_embeddings.pkl') and os.path.exists(
+                self.file_path + 'final_embeddings/news_embeddings.pkl'):
+            user_embeddings = load_pickle(self.file_path + 'final_embeddings/user_embeddings.pkl')
+            news_embeddings = load_pickle(self.file_path + 'final_embeddings/news_embeddings.pkl')
+            labels = load_pickle(self.file_path + 'final_embeddings/labels.pkl')
+        else:
+            user_embeddings = []
+            news_embeddings = []
+            labels = []
+            for _, row in self.behaviors.iterrows():
+                user_id = row['user_id']
+                impressions = row['impressions']
+                for news_id, label in impressions:
+                    if user_id in hybrid_user_embeddings and news_id in hybrid_news_embeddings:
+                        user_embeddings.append(hybrid_user_embeddings[user_id])
+                        news_embeddings.append(hybrid_news_embeddings[news_id])
+                        labels.append(label)
+            labels = list(map(int, labels))
+            save_pickle(user_embeddings, self.file_path + 'final_embeddings/user_embeddings.pkl')
+            save_pickle(news_embeddings, self.file_path + 'final_embeddings/news_embeddings.pkl')
+            save_pickle(labels, self.file_path + 'final_embeddings/labels.pkl')
+
+        return user_embeddings, news_embeddings, labels
 
     def run(self):
-        if os.path.exists('interaction_matrix.pkl'):
-            with open('interaction_matrix.pkl', 'rb') as f:
-                int_matrix = pickle.load(f)
+        if os.path.exists(self.file_path + 'interaction_matrix.pkl'):
+            int_matrix = load_pickle(self.file_path + 'interaction_matrix.pkl')
         else:
             int_matrix = self.create_interaction_matrix()
-            with open('interaction_matrix.pkl', 'wb') as f:
-                pickle.dump(int_matrix, f)
+            save_pickle(int_matrix, self.file_path + 'interaction_matrix.pkl')
 
-        if os.path.exists('embeddings.pkl'):
-            with open('embeddings.pkl', 'rb') as f:
-                embeddings = pickle.load(f)
+        if os.path.exists(self.file_path + 'embeddings.pkl'):
+            embeddings = load_pickle(self.file_path + 'embeddings.pkl')
         else:
             self.news['abstract'] = self.news['abstract'].apply(self.preprocess_text)
-            self.news['title_embedding'] = self.news['title'].apply(self.encode_with_bert)
-            self.news['abstract_embedding'] = self.news['abstract'].apply(self.encode_with_bert)
-            embeddings = self.news[['title_embedding', 'abstract_embedding']]
-            with open('embeddings.pkl', 'wb') as f:
-                pickle.dump(embeddings, f)
+            title_embeddings = self.encode_texts_with_bert(self.news['title'].tolist())
+            self.news['title_embedding'] = list(title_embeddings)  # Convert to list
 
-        if os.path.exists('news_features.pkl'):
-            with open('news_features.pkl', 'rb') as f:
-                news_features = pickle.load(f)
+            abstract_embeddings = self.encode_texts_with_bert(self.news['abstract'].tolist())
+            self.news['abstract_embedding'] = list(abstract_embeddings)  # Convert to list
+            embeddings = self.news[['news_id', 'title_embedding', 'abstract_embedding']]
+            save_pickle(embeddings, self.file_path + 'embeddings.pkl')
+
+        if os.path.exists(self.file_path + 'news_features.pkl'):
+            news_features = load_pickle(self.file_path + 'news_features.pkl')
         else:
             self.news['title_embedding'] = embeddings['title_embedding']
             self.news['abstract_embedding'] = embeddings['abstract_embedding']
@@ -130,8 +182,7 @@ class FeatureEngineering:
             model = Word2Vec(sentences=all_entities, vector_size=100, window=5, min_count=1, workers=4)
             self.news['entity_embeddings'] = self.news['combined_entities'].apply(
                 lambda x: self.compute_entity_embedding(x, model))
-            with open('news_features.pkl', 'wb') as f:
-                pickle.dump(self.news, f)
+            save_pickle(self.news[['news_id', 'entity_embeddings']], self.file_path + 'news_features.pkl')
 
             category_encoded = pd.get_dummies(self.news['category'], prefix='category')
             subcategory_encoded = pd.get_dummies(self.news['sub_category'], prefix='sub_category')
@@ -140,12 +191,10 @@ class FeatureEngineering:
             self.subcategory_columns = subcategory_encoded.columns.tolist()
 
             self.news['combined_features'] = self.news.apply(self.combine_features, axis=1)
-            with open('combined_features.pkl', 'wb') as f:
-                pickle.dump(self.news[['news_id', 'combined_features']], f)
+            save_pickle(self.news[['news_id', 'combined_features']], self.file_path + 'combined_features.pkl')
 
-        if os.path.exists('user_features.pkl'):
-            with open('user_features.pkl', 'rb') as f:
-                user_profiles = pickle.load(f)
+        if os.path.exists(self.file_path + 'user_features.pkl'):
+            user_profiles = load_pickle(self.file_path + 'user_features.pkl')
         else:
             self.behaviors['history'] = self.behaviors['history'].apply(eval)
             news_embeddings_map = {
@@ -160,82 +209,45 @@ class FeatureEngineering:
                                     article_id in news_embeddings_map]
                 if valid_embeddings:
                     user_profiles[user_id] = np.mean(valid_embeddings, axis=0)
-            with open('user_features.pkl', 'wb') as f:
-                pickle.dump(user_profiles, f)
+            save_pickle(user_profiles, self.file_path + 'user_features.pkl')
 
-        if os.path.exists('user_cf_embeddings.pkl') and os.path.exists('news_cf_embeddings.pkl'):
-            with open('user_cf_embeddings.pkl', 'rb') as f:
-                user_cf_embeddings = pickle.load(f)
-            with open('news_cf_embeddings.pkl', 'rb') as f:
-                news_cf_embeddings = pickle.load(f)
+        if os.path.exists(self.file_path + 'user_cf_embeddings.pkl') and os.path.exists(
+                self.file_path + 'news_cf_embeddings.pkl'):
+            user_cf_embeddings = load_pickle(self.file_path + 'user_cf_embeddings.pkl')
+            news_cf_embeddings = load_pickle(self.file_path + 'news_cf_embeddings.pkl')
         else:
-            interaction_matrix = int_matrix.T
-            als = AlternatingLeastSquares(factors=128, regularization=0.1, iterations=20)
-            als.fit(interaction_matrix.T)
+            interaction_matrix = int_matrix
+            als = AlternatingLeastSquares(
+                factors=128,
+                regularization=0.05,
+                iterations=15,
+                use_gpu=False
+            )
+
+            als.fit(interaction_matrix.astype(np.float32))
             user_cf_embeddings = als.user_factors
             news_cf_embeddings = als.item_factors
-            with open('user_cf_embeddings.pkl', 'wb') as f:
-                pickle.dump(user_cf_embeddings, f)
-            with open('news_cf_embeddings.pkl', 'wb') as f:
-                pickle.dump(news_cf_embeddings, f)
+            save_pickle(user_cf_embeddings, self.file_path + 'user_cf_embeddings.pkl')
+            save_pickle(news_cf_embeddings, self.file_path + 'news_cf_embeddings.pkl')
+
+        self.behaviors['impressions'] = self.behaviors['impressions'].apply(literal_eval)
+
+        self.behaviors.to_csv(self.file_path + 'behaviors_feature_engineered.csv', index=False)
+        self.news.to_csv(self.file_path + 'news_feature_engineered.csv', index=False)
 
         user_ids = set(self.behaviors['user_id'])
         news_ids = set()
         for history in self.behaviors['history']:
             news_ids.update(ast.literal_eval(history))
 
-        unique_users = sorted(set(user_ids))
-        unique_news = sorted(set(news_ids))
-        user_id_to_index = {user_id: idx for idx, user_id in enumerate(unique_users)}
-        news_id_to_index = {news_id: idx for idx, news_id in enumerate(unique_news)}
-        filtered_news_id_to_index = {news_id: idx for news_id, idx in news_id_to_index.items() if
-                                     idx < len(news_cf_embeddings)}
-
-        news_cf_map = {news_id: news_cf_embeddings[idx] for news_id, idx in filtered_news_id_to_index.items()}
-        user_cf_map = {user_id: user_cf_embeddings[idx] for user_id, idx in user_id_to_index.items()}
-
-        with open('combined_features.pkl', 'rb') as f:
-            content_embeddings = pickle.load(f)
-
-        content_embeddings_dict = content_embeddings.set_index('news_id')['combined_features'].to_dict()
-        hybrid_user_embeddings = {user_id: np.concatenate([user_cf_map[user_id], user_profiles[user_id]]) for user_id in
-                                  user_cf_map if user_id in user_profiles}
-        hybrid_news_embeddings = {news_id: np.concatenate([news_cf_map[news_id], content_embeddings_dict[news_id]]) for
-                                  news_id in news_cf_map if news_id in content_embeddings_dict}
-
-        user_embeddings = []
-        news_embeddings = []
-        labels = []
-
-        self.behaviors['impressions'] = self.behaviors['impressions'].apply(literal_eval)
-        for _, row in self.behaviors.iterrows():
-            user_id = row['user_id']
-            impressions = row['impressions']
-            for news_id, label in impressions:
-                if user_id in hybrid_user_embeddings and news_id in hybrid_news_embeddings:
-                    user_embeddings.append(hybrid_user_embeddings[user_id])
-                    news_embeddings.append(hybrid_news_embeddings[news_id])
-                    labels.append(label)
-
-        for idx, emb in enumerate(news_embeddings):
-            if len(emb) != len(news_embeddings[0]):
-                print(f"Inconsistent shape at index {idx}: {len(emb)}")
+        hybrid_user_embeddings, hybrid_news_embeddings = self.get_hybrid_embeddings(user_ids, news_ids,
+                                                                                    user_cf_embeddings,
+                                                                                    news_cf_embeddings, user_profiles)
 
         user_embedding_dim = len(next(iter(hybrid_user_embeddings.values())))
         news_embedding_dim = len(next(iter(hybrid_news_embeddings.values())))
+        save_pickle(news_embedding_dim, self.file_path + 'final_embeddings/news_embedding_dim.pkl')
+        save_pickle(user_embedding_dim, self.file_path + 'final_embeddings/user_embedding_dim.pkl')
+        user_embeddings, news_embeddings, labels = self.load_data(hybrid_user_embeddings, hybrid_news_embeddings)
+        return user_embedding_dim, news_embedding_dim, user_embeddings, news_embeddings, labels
 
-        user_input = Input(shape=(user_embedding_dim,), name="user_input")
-        news_input = Input(shape=(news_embedding_dim,), name="news_input")
-        combined = Concatenate()([user_input, news_input])
-        x = Dense(128, activation='relu')(combined)
-        x = Dense(64, activation='relu')(x)
-        output = Dense(1, activation='sigmoid', name="output")(x)
-
-        model = Model(inputs=[user_input, news_input], outputs=output)
-        model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
-
-        user_embeddings = np.array(user_embeddings)
-        news_embeddings = np.array(news_embeddings)
-        labels = np.array(labels)
-
-        model.fit([user_embeddings, news_embeddings], labels, batch_size=256, epochs=10, validation_split=0.1)
