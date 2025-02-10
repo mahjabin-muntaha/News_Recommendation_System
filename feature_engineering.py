@@ -11,6 +11,7 @@ import os
 import numpy as np
 from implicit.als import AlternatingLeastSquares
 from util import load_pickle, save_pickle
+import random
 
 class FeatureEngineering:
     def __init__(self, behaviors, news, location):
@@ -53,6 +54,11 @@ class FeatureEngineering:
             shape=(num_users, num_news)
         )
         return interaction_matrix
+
+    def negative_sampling(self, user_id, all_news, user_clicks, k=5):
+        """ Generate 'hard negative' samples by choosing non-clicked articles from shown impressions """
+        negatives = [news for news in all_news if news not in user_clicks]
+        return random.sample(negatives, min(k, len(negatives)))  # Select K hard negatives
 
     def encode_texts_with_bert(self, texts, batch_size=16):
         """ Efficiently encode texts using DistilBERT in smaller batches """
@@ -138,14 +144,17 @@ class FeatureEngineering:
             user_embeddings = []
             news_embeddings = []
             labels = []
+
             for _, row in self.behaviors.iterrows():
                 user_id = row['user_id']
                 impressions = row['impressions']
+                # Add positive samples
                 for news_id, label in impressions:
                     if user_id in hybrid_user_embeddings and news_id in hybrid_news_embeddings:
                         user_embeddings.append(hybrid_user_embeddings[user_id])
                         news_embeddings.append(hybrid_news_embeddings[news_id])
                         labels.append(label)
+
             labels = list(map(int, labels))
             save_pickle(user_embeddings, self.file_path + 'final_embeddings/user_embeddings.pkl')
             save_pickle(news_embeddings, self.file_path + 'final_embeddings/news_embeddings.pkl')
@@ -218,9 +227,9 @@ class FeatureEngineering:
         else:
             interaction_matrix = int_matrix
             als = AlternatingLeastSquares(
-                factors=128,
-                regularization=0.05,
-                iterations=15,
+                factors=256,
+                regularization=0.03,
+                iterations=25,
                 use_gpu=False
             )
 
@@ -250,4 +259,3 @@ class FeatureEngineering:
         save_pickle(user_embedding_dim, self.file_path + 'final_embeddings/user_embedding_dim.pkl')
         user_embeddings, news_embeddings, labels = self.load_data(hybrid_user_embeddings, hybrid_news_embeddings)
         return user_embedding_dim, news_embedding_dim, user_embeddings, news_embeddings, labels
-
